@@ -104,6 +104,29 @@ def disasm_one(code, va):
     return ins
 
 
+def have_appletvos_sdk():
+    return subprocess.run(
+        ["xcrun", "--sdk", "appletvos", "--show-sdk-path"], capture_output=True
+    ).returncode == 0
+
+
+def assembler_cmd():
+    # Stubs are raw ARM64 code and only __text bytes are extracted, so no SDK
+    # headers or libraries are involved. Prefer the tvOS SDK's clang (full
+    # Xcode); otherwise fall back to Command Line Tools clang, which emits
+    # identical instruction bytes for an arm64-apple-tvos target.
+    global _ASSEMBLER_CMD
+    if _ASSEMBLER_CMD is None:
+        if have_appletvos_sdk():
+            _ASSEMBLER_CMD = ["xcrun", "--sdk", "appletvos", "clang"]
+        else:
+            _ASSEMBLER_CMD = ["xcrun", "clang", "-Wno-incompatible-sysroot"]
+    return _ASSEMBLER_CMD
+
+
+_ASSEMBLER_CMD = None
+
+
 def asm_lines(lines):
     # Assemble ARM64 source with Apple's assembler and return __text bytes only.
     asm_text = ".text\n.align 2\n" + "\n".join(lines) + "\n"
@@ -112,10 +135,7 @@ def asm_lines(lines):
         obj_path = Path(tmpdir) / "stub.o"
         asm_path.write_text(asm_text)
         cmd = [
-            "xcrun",
-            "--sdk",
-            "appletvos",
-            "clang",
+            *assembler_cmd(),
             "-c",
             "-target",
             "arm64-apple-tvos",
@@ -168,9 +188,11 @@ def restore_regs():
 def load_payload():
     # Payload is source-of-truth JS kept in a dedicated file.
     # Ignore full-line // comments so notes can live in inject.js without
-    # being embedded into the runtime payload.
+    # being embedded into the runtime payload. Indentation and blank lines are
+    # dropped too: the payload lives in limited __TEXT header padding.
     text = Path(__file__).with_name("inject.js").read_text(encoding="ascii")
-    lines = [line for line in text.splitlines() if not line.lstrip().startswith("//")]
+    lines = [line.strip() for line in text.splitlines()]
+    lines = [line for line in lines if line and not line.startswith("//")]
     cleaned = "\n".join(lines).strip()
     if not cleaned:
         raise ValueError("inject.js is empty")
@@ -192,7 +214,14 @@ def parse_macho_info(data):
     if not text or not stubs or not text_seg or not dysym:
         raise ValueError("required Mach-O structures missing (__TEXT/__text/__stubs/dysymtab)")
 
+    # Unused tail of __TEXT: after its last section up to the segment end
+    # (page-alignment slack). Same mapping/permissions as the header padding.
+    sect_end = max(s.offset + s.size for s in text_seg.sections)
+    seg_end = text_seg.file_offset + text_seg.file_size
+
     return {
+        "tail_start": sect_end,
+        "tail_end": seg_end,
         "text_va": text.virtual_address,
         "text_off": text.offset,
         "text_size": text.size,
@@ -426,10 +455,17 @@ def patch_binary(data, enable_printf_logs=False):
         return off
 
     js = load_payload()
-    # Embed runtime strings and payload in __TEXT header padding.
+    # The JS payload is the largest blob: it goes in the unused tail of
+    # __TEXT. Stubs and short strings stay in the header padding.
+    tail_start, tail_end = info["tail_start"], info["tail_end"]
+    if any(data[tail_start:tail_end]):
+        raise ValueError("__TEXT tail slack is not empty (already patched?)")
+    if len(js) + 1 > tail_end - tail_start:
+        raise ValueError(f"inject.js payload ({len(js)} bytes) exceeds __TEXT tail slack ({tail_end - tail_start} bytes)")
+    data[tail_start:tail_start + len(js)] = js
     offs = {
         "yttv": put(YTTV_NEEDLE + b"\0"),
-        "inject": put(js + b"\0"),
+        "inject": tail_start,
         "csp": put(CSP_PREFIX + b"\0"),
         "vp9_profile2_full": put(b"vp09.02\0"),
         "vp9_profile2_short": put(b"vp9.2\0"),

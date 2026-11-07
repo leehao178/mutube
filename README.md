@@ -27,6 +27,18 @@ Optional printf tracing in stubs:
 make PRINTF_LOGS=1
 ```
 
+### Restore
+
+`patcher.py` only accepts an unmodified decrypted IPA. If you only have a previously built
+`mutube.ipa`, recover the original from it first:
+
+```bash
+make restore RESTORE_IN=/path/to/old-mutube.ipa   # writes ./ipa/YouTube_4.54.01_decrypted.ipa
+make                                              # rebuild with the current patcher/inject.js
+```
+
+This works for IPAs built by the Frida-less patcher for 4.54.01; older Frida-based builds cannot be restored.
+
 ## Usage
 
 Sideload the generated `mutube.ipa` onto your Apple TV using a tool like [Sideloadly](https://sideloadly.io/).
